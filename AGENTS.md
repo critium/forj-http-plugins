@@ -172,7 +172,7 @@ generic in `F` with the weakest capability, 4-space indentation, javadoc saying 
 
 ### forj limits currently worked around here
 
-None. (forj-http has one: `req.jsonBody()` instead of `req.json()`; see `../server/AGENTS.md`.)
+None.
 
 ### When forj gets in the way
 

@@ -48,7 +48,7 @@ A CRUD service in `examples/`, written the way forj-http intends:
 
 ```java
 POST("/users").to(req -> {
-    NewUser body = req.jsonBody();
+    NewUser body = req.json();
     NewUser valid = body.valid();                                   // 422 if not
     return forj {
         taken <- repo.findByName(valid.name());

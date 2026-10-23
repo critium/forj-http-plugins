@@ -47,7 +47,7 @@ public final class UserRoutes {
                         .map(found -> found.map(user -> Ok(json(user))).orElseGet(() -> missing(id)))),
 
                 POST("/users").to(req -> {
-                    NewUser body = req.jsonBody();
+                    NewUser body = req.json();
                     NewUser valid = body.valid();
                     return forj {
                         taken <- repo.findByName(valid.name());
@@ -58,7 +58,7 @@ public final class UserRoutes {
                 }),
 
                 PUT(USER).to((req, id) -> {
-                    NewUser body = req.jsonBody();
+                    NewUser body = req.json();
                     return repo.replace(id, body.valid())
                             .map(found -> found.map(user -> Ok(json(user))).orElseGet(() -> missing(id)));
                 }),
