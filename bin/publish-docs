@@ -23,7 +23,7 @@ set -euo pipefail
 # Mill module -> path of its javadoc on the site
 MODULES=("helidon:api")
 # Markdown published next to the javadoc; README.md becomes the front page
-PAGES=("README.md")
+PAGES=("README.md" "docs")
 # root-relative: /<repo>/ is on the site's domain, so this is critium.github.io/javadoc.css
 STYLE_URL="/javadoc.css"
 # the site's shared nav bar: draws the links to critium and every project, on hosted pages only

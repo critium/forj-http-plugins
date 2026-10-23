@@ -158,3 +158,68 @@ object examples extends ForjModule {
 
   object test extends MavenTests with PluginsTests
 }
+
+val benchJvm = "temurin:25"
+
+/**
+ * A server bin/bench starts outside Mill, so the load generator measures it rather than Mill:
+ * its JDK, main class and classpath, and the classpath's size on disk (the "jar size" row: the
+ * app and everything it ships with).
+ */
+trait BenchServer extends JavaModule {
+  def benchLaunch = Task {
+    val cp = runClasspath().map(_.path).filter(os.exists(_))
+    def size(p: os.Path): Long =
+      if (os.isDir(p)) os.walk(p).filter(os.isFile(_)).map(os.size(_)).sum else os.size(p)
+    ujson.Obj(
+      "javaHome" -> javaHome().map(_.path.toString).getOrElse(sys.props("java.home")),
+      "mainClass" -> finalMainClass(),
+      "classpath" -> cp.mkString(java.io.File.pathSeparator),
+      "bytes" -> cp.map(size).sum.toDouble
+    )
+  }
+}
+
+/**
+ * The end-to-end benchmark, not published: the same three endpoints (plaintext, JSON, a user
+ * read from an in-memory store) in forj-http on Helidon (this module) and in the comparison
+ * servers below. bin/bench runs them one at a time under oha and writes docs/benchmarks.md.
+ *
+ * The comparison servers are plain Java or Scala on JDK 25 (an LTS): Scala, Spring and
+ * http4s don't need preview features and may not read JDK 28 class files. Raw Helidon SE is
+ * compiled for 25 so bin/bench can run it on both JDKs.
+ */
+object bench extends ForjModule with BenchServer {
+  def moduleDeps = Seq(helidon, examples)
+  def mvnDeps = super.mvnDeps() ++ Seq(mvn"forj:forj-http-json:$forjVersion")
+  def mainClass = Some("forj.bench.ForjHttpMain")
+
+  object test extends MavenTests with PluginsTests
+
+  /** Raw Helidon SE 4: the floor, so forj-http's row shows its overhead over the engine. */
+  object helidonse extends MavenModule with BenchServer {
+    def jvmId = benchJvm
+    def mvnDeps = Seq(mvn"io.helidon.webserver:helidon-webserver:$helidonVersion")
+    def mainClass = Some("forj.bench.helidonse.HelidonSeMain")
+  }
+
+  /** Spring Boot MVC on virtual threads (Tomcat, Jackson): what most Java services run. */
+  object spring extends MavenModule with BenchServer {
+    def jvmId = benchJvm
+    def mvnDeps = Seq(mvn"org.springframework.boot:spring-boot-starter-webmvc:4.1.2")
+    def mainClass = Some("forj.bench.spring.SpringMain")
+  }
+
+  /** http4s on Ember with jsoniter-scala codecs: the pure-FP design forj-http is modelled on. */
+  object http4s extends mill.scalalib.SbtModule with BenchServer {
+    def jvmId = benchJvm
+    def scalaVersion = "3.9.0"
+    def mvnDeps = Seq(
+      mvn"org.http4s::http4s-ember-server:0.23.38",
+      mvn"org.http4s::http4s-dsl:0.23.38",
+      mvn"com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-core:2.42.0"
+    )
+    def compileMvnDeps = Seq(mvn"com.github.plokhotnyuk.jsoniter-scala::jsoniter-scala-macros:2.42.0")
+    def mainClass = Some("forj.bench.http4s.Http4sMain")
+  }
+}

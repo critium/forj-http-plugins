@@ -7,8 +7,17 @@ one.
 API docs (javadoc): https://critium.github.io/forj-http-plugins/api/
 
 **Status:** the Helidon backend is published locally (`forj-http-helidon`), and the users example
-runs on it. Next: the end-to-end benchmark (forj-http on Helidon vs raw Helidon SE vs http4s
-Ember).
+runs on it. The end-to-end benchmark compares forj-http on Helidon with raw Helidon SE, http4s
+Ember and Spring Boot MVC ([docs/benchmarks.md](docs/benchmarks.md)):
+- forj-http matches raw Helidon SE, with a p99 of 0.8 ms: within 1–2% at about 107k req/s
+  uncapped (run 1), and within 1% at about 105k req/s with the servers capped at 4 cores (run 2,
+  `SERVER_CPUS=4`);
+- in run 2, http4s handles 24–35% fewer requests than forj-http and Spring 10–28% fewer;
+- forj-http starts in about 330 ms, http4s in 760 ms and Spring in 860 ms.
+
+Both runs had the load generator (oha) on the same machine, and it was the ceiling for every
+Helidon-based row, so forj-http's own overhead over Helidon is too small for them to measure.
+[docs/benchmarks.md](docs/benchmarks.md) has the full tables and the exact wording.
 
 ## The Helidon backend
 
@@ -84,7 +93,7 @@ The server logs one line per request: `POST /users 201 5.3ms id=8e4810ebedc787ad
 |---|---|---|
 | `helidon` | `forj-http-helidon` (published) | `HelidonBackend`: forj-http's `Backend` on Helidon WebServer 4 |
 | `examples` | not published | `forj.examples.http.users`: the users example, its route tests and a live test |
-| `bench` (planned) | not published | the end-to-end benchmark, `bin/bench`, `docs/benchmarks.md` |
+| `bench` | not published | the end-to-end benchmark: forj-http on Helidon, with raw Helidon SE (`bench.helidonse`), http4s Ember (`bench.http4s`) and Spring Boot MVC (`bench.spring`) to compare; run by `bin/bench`, results in [docs/benchmarks.md](docs/benchmarks.md) |
 
 ## Building
 

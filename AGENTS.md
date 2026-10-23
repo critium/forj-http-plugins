@@ -137,10 +137,13 @@ only where a file must stay parseable by plain tools.
 | `helidon/src/test/java/forj/http/helidon/` | `HelidonBackendTest`: live tests on a random port with the JDK `HttpClient`, in `IO` and `Callable` |
 | `examples/src/main/java/forj/examples/http/users/` | the users example: `User`/`NewUser` (`derives Codec`), `UserRepo<F<_>>` (tagless, in-memory interpreter), `UserRoutes`, `Main` |
 | `examples/src/test/java/forj/examples/http/users/` | `UserRoutesTest` (no server, `IO` and `Callable`), `UsersLiveTest` (`Main.app()` on Helidon) |
-| `build.mill` | `PinnedJdk`, `ForjModule`, `docStyle`: copied from forj's recipe via `../server/build.mill`; keep in step with them |
-
-Planned (see the plan's "Order of work"): `bench`, the end-to-end benchmark (forj-http on
-Helidon vs raw Helidon SE vs http4s Ember), `bin/bench` and `docs/benchmarks.md`.
+| `bench/src/main/java/forj/bench/` | `ForjHttpMain`: forj-http's rows in the benchmark (plaintext, JSON, a user by id over the example's `UserRepo`), with `FORJ_BENCH_JSON=codec|hand|stream` choosing how JSON is written; its test checks the bodies every row must give, in each mode |
+| `bench/helidonse/`, `bench/http4s/`, `bench/spring/` | the comparison servers: raw Helidon SE, http4s Ember (Scala), Spring Boot MVC. Plain Java/Scala on JDK 25 (Mill fetches it), no forj |
+| `bin/bench` | runs each server under oha and writes a results table (`--check`: start and check answers, no load; `SERVER_CPUS=N`: each server's JVM sized for N cores) |
+| `docs/benchmarks.md` | the human page: current results (both runs), method, the oha-and-loopback ceiling caveat |
+| `docs/benchmarks-for-agents.md` | process, reasoning, the run log, open questions and how to continue. Read it before any benchmark work |
+| `docs/index.md` | the docs folder's index on GitHub Pages |
+| `build.mill` | `PinnedJdk`, `ForjModule`, `docStyle`: copied from forj's recipe via `../server/build.mill`; keep in step with them. `BenchServer`: what `bin/bench` needs to launch a server outside Mill |
 
 ### Design rules (don't undo these without asking)
 
@@ -162,6 +165,15 @@ Helidon vs raw Helidon SE vs http4s Ember), `bin/bench` and `docs/benchmarks.md`
   generic in `F` with the repository as a context parameter, JSON via `forj-http-json`, the
   standard middleware stack, `Main` reading `ServerConfig.fromEnvironment()`.
 - **`examples` and `bench` aren't published;** `helidon` is (`forj-http-helidon`).
+- **Every bench server gives the same bodies,** which `bin/bench` checks before loading it. A
+  new row (our own engine, later) is a module under `bench` plus a case in `bin/bench`. Spring
+  and Jackson are reference rows only: reflection-based, never a dependency of `helidon`.
+- **Don't run `bin/bench` alongside other timing-sensitive work** on the same machine (e.g.
+  forj-codec's JMH run); check with forj-orchestrator first, and tell it when the run ends.
+- **Human docs describe the current state only** (`README.md`, `docs/benchmarks.md`).
+  Reasoning, history, experiments and open questions go in `docs/benchmarks-for-agents.md`.
+  `docs/benchmarks.md` is the single source of the benchmark's wording and figures, each tied
+  to the run it comes from; the README and the critium site follow it.
 
 ### Style
 
@@ -191,13 +203,17 @@ it. Time-box hard javac debugging and write down what you found.
 - `./mill examples.runMain forj.examples.http.users.Main` serves the users example on 8080
   (`FORJ_HTTP_PORT` / `-Dforj.http.port` to change it).
 - `./mill helidon.publishM2Local` publishes `forj:forj-http-helidon`.
+- `bin/bench --check` starts every bench server and checks its answers, without load;
+  `bin/bench [servers...]` is the load run (see `docs/benchmarks-for-agents.md` first).
 - **Hosted docs:** `bin/publish-docs` (copied from forj; `MODULES=("helidon:api")`,
-  `PAGES=("README.md")`). `--push` force-pushes `gh-pages`: **only with the user's OK**, and
-  the same for enabling Pages.
+  `PAGES=("README.md" "docs")`, so `docs/*.md` is served under `/forj-http-plugins/docs/`).
+  `--push` force-pushes `gh-pages`: **the user runs it**, never an agent; the same for enabling
+  Pages.
 
 ### Working rules
 
-- Commit only when asked.
+- **No commits or pushes from agents:** the user commits and pushes by hand. Leave changes
+  uncommitted and tell forj-orchestrator what is waiting.
 - Don't modify other repos (`../../forj`, `../codec`, `../server`, `../planning`) without
   asking: other sessions work there. Logging a limit in forj's `TODO.md` is the exception.
 - Every step of the plan ends with `./mill __.test` green. The plan pauses for review after
