@@ -1,0 +1,4 @@
+title: forj-http-plugins
+defaults:
+  - scope: { path: "" }
+    values: { layout: default }

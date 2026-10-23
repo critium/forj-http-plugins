@@ -1,0 +1,1 @@
+memberSearchIndex = [{"p":"forj.http.helidon","c":"HelidonBackend","l":"create()","k":"6"},{"p":"forj.http.helidon","c":"HelidonBackend","l":"start(ServerConfig, HttpApp, Effect)","u":"start(forj.http.server.ServerConfig,forj.http.HttpApp,forj.typeclass.Effect)"}];updateSearchResults();
