@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# The end-to-end benchmark: starts each server in turn, checks it answers like the others, loads
+# it with oha, and records throughput, latency, startup time, memory and size.
+#
+#   bin/bench                         # every server
+#   bin/bench forj-http helidon-se-28 # just these
+#   DURATION=30s CONNECTIONS=128 bin/bench
+#   bin/bench --check                 # start each server and check its answers, no load
+#   SERVER_CPUS=4 bin/bench           # servers see 4 cores, oha keeps the rest
+#
+# Servers (the bench module in build.mill): forj-http (forj-http on Helidon, JDK 28, JSON by
+# forj-codec as an app writes it), forj-http-hand (JSON by hand, like raw Helidon SE's),
+# forj-http-stream (forj-codec writing straight to the connection), helidon-se-28 and helidon-se-25 (raw Helidon SE on each JDK), http4s (Ember, JDK 25) and
+# spring (Spring Boot MVC on virtual threads, JDK 25).
+#
+# Every server gets the same JVM flags ($JVM_FLAGS), port and endpoints; each endpoint gets a
+# warmup run, then a measured one, with the same connections and duration. oha runs on the same
+# machine, so absolute numbers are a lower bound; the ratios between rows are the point.
+# Results go to out/bench/<time>/: oha's JSON per run, server logs, and results.md, the table for
+# docs/benchmarks.md.
+#
+# SERVER_CPUS caps the cores each server's JVM sizes itself for (-XX:ActiveProcessorCount: the
+# virtual-thread carriers, cats-effect's compute pool, GC threads), so the server, not oha, is
+# the bottleneck. macOS has no real CPU pinning; on Linux, taskset would be stricter.
+#
+# Needs oha (brew install oha) and jq. Don't run it while anything else timing-sensitive is.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+DURATION="${DURATION:-15s}"
+WARMUP="${WARMUP:-10s}"
+CONNECTIONS="${CONNECTIONS:-64}"
+PORT="${PORT:-18080}"
+JVM_FLAGS="${JVM_FLAGS:--Xmx1g}"
+SERVER_CPUS="${SERVER_CPUS:-}"
+if [ -n "$SERVER_CPUS" ]; then JVM_FLAGS="$JVM_FLAGS -XX:ActiveProcessorCount=$SERVER_CPUS"; fi
+
+ALL=(forj-http forj-http-hand forj-http-stream helidon-se-28 helidon-se-25 http4s spring)
+CHECK_ONLY=""
+if [ "${1:-}" = --check ]; then CHECK_ONLY=1; shift; fi
+if [ $# -eq 0 ]; then SERVERS=("${ALL[@]}"); else SERVERS=("$@"); fi
+
+for tool in oha jq curl perl; do
+  command -v "$tool" >/dev/null || { echo "bench: needs $tool (brew install $tool)" >&2; exit 1; }
+done
+
+OUT="out/bench/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$OUT"
+BASE="http://127.0.0.1:$PORT"
+
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
+
+# server name -> Mill module, and the JDK it runs on ("module" = the module's own)
+module_of() {
+  case "$1" in
+    forj-http | forj-http-hand | forj-http-stream) echo bench ;;
+    helidon-se-28 | helidon-se-25) echo bench.helidonse ;;
+    http4s) echo bench.http4s ;;
+    spring) echo bench.spring ;;
+    *) echo "bench: unknown server $1 (one of: ${ALL[*]})" >&2; exit 1 ;;
+  esac
+}
+java_home_of() {
+  case "$1" in
+    helidon-se-28) echo "$PWD/.jdk/preview" ;;
+    *) jq -r .javaHome "$OUT/$1.launch.json" ;;
+  esac
+}
+
+# forj-http's rows are one server; FORJ_BENCH_JSON picks how it writes JSON
+json_mode_of() {
+  case "$1" in
+    forj-http-hand) echo hand ;;
+    forj-http-stream) echo stream ;;
+    *) echo codec ;;
+  esac
+}
+
+# the bodies every server must give, so no row wins by doing less
+check() {
+  local name="$1" path="$2" want_type="$3" want_body="$4" got_type got_body
+  got_body="$(curl -s -D "$OUT/headers" "$BASE$path")"
+  got_type="$(grep -i '^content-type:' "$OUT/headers" | tr -d '\r' | cut -d' ' -f2- | cut -d';' -f1 | tr 'A-Z' 'a-z')"
+  if [ "$got_body" != "$want_body" ] || [ "$got_type" != "$want_type" ]; then
+    echo "bench: $name: GET $path gave [$got_type] $got_body; want [$want_type] $want_body" >&2
+    return 1
+  fi
+}
+
+PID=""
+stop() {
+  if [ -n "$PID" ]; then
+    kill "$PID" 2>/dev/null || true
+    wait "$PID" 2>/dev/null || true
+    PID=""
+  fi
+}
+trap stop EXIT
+
+echo "bench: building ${SERVERS[*]}"
+for name in "${SERVERS[@]}"; do
+  module="$(module_of "$name")"
+  ./mill show "$module.benchLaunch" > "$OUT/$name.launch.json" 2> "$OUT/build.log" \
+    || { cat "$OUT/build.log" >&2; exit 1; }
+done
+
+if curl -s -o /dev/null "$BASE/"; then
+  echo "bench: something already listens on port $PORT" >&2
+  exit 1
+fi
+
+ENDPOINTS=(plaintext json users)
+url_of() {
+  case "$1" in
+    plaintext) echo "$BASE/plaintext" ;;
+    json) echo "$BASE/json" ;;
+    # a random user 1-999 per request, so it's a lookup, not one cached answer
+    users) echo "$BASE/users/[1-9][0-9]{0,2}" ;;
+  esac
+}
+oha_args() { [ "$1" = users ] && echo --rand-regex-url || true; }
+
+printf 'server\tjdk\tendpoint\trps\tp50_ms\tp99_ms\tnon2xx\tstartup_ms\trss_mb\tsize_mb\n' > "$OUT/results.tsv"
+
+for name in "${SERVERS[@]}"; do
+  launch="$OUT/$name.launch.json"
+  java_home="$(java_home_of "$name")"
+  jdk="$("$java_home/bin/java" -XshowSettings:properties -version 2>&1 | awk -F' = ' '/java.runtime.version/ {print $2}')"
+  size_mb="$(jq -r '.bytes / 1048576 * 10 | round / 10' "$launch")"
+  echo "bench: $name on JDK $jdk"
+
+  start="$(now_ms)"
+  # shellcheck disable=SC2086
+  FORJ_HTTP_PORT="$PORT" FORJ_BENCH_JSON="$(json_mode_of "$name")" "$java_home/bin/java" $JVM_FLAGS -cp "$(jq -r .classpath "$launch")" "$(jq -r .mainClass "$launch")" \
+    > "$OUT/$name.log" 2>&1 &
+  PID=$!
+  until curl -s -o /dev/null -f "$BASE/plaintext"; do
+    kill -0 "$PID" 2>/dev/null || { echo "bench: $name exited; see $OUT/$name.log" >&2; exit 1; }
+    [ $(( $(now_ms) - start )) -lt 60000 ] || { echo "bench: $name didn't answer in 60s" >&2; exit 1; }
+    sleep 0.01
+  done
+  startup_ms=$(( $(now_ms) - start ))
+
+  check "$name" /plaintext text/plain 'Hello, World!'
+  check "$name" /json application/json '{"message":"Hello, World!"}'
+  check "$name" /users/1 application/json '{"id":1,"name":"user1","email":"user1@example.com"}'
+  if [ -n "$CHECK_ONLY" ]; then
+    echo "  answers as expected; started in $startup_ms ms, $(( $(ps -o rss= -p "$PID") / 1024 )) MB RSS, $size_mb MB on disk"
+    stop
+    continue
+  fi
+
+  for endpoint in "${ENDPOINTS[@]}"; do
+    url="$(url_of "$endpoint")"
+    # shellcheck disable=SC2046
+    oha --no-tui -z "$WARMUP" -c "$CONNECTIONS" $(oha_args "$endpoint") "$url" > /dev/null
+    # shellcheck disable=SC2046
+    oha --no-tui -z "$DURATION" -c "$CONNECTIONS" --output-format json $(oha_args "$endpoint") "$url" > "$OUT/$name.$endpoint.json"
+    rss_mb=$(( $(ps -o rss= -p "$PID") / 1024 ))
+    jq -r --arg name "$name" --arg jdk "$jdk" --arg endpoint "$endpoint" \
+      --arg startup "$startup_ms" --arg rss "$rss_mb" --arg size "$size_mb" '
+      [ $name, $jdk, $endpoint,
+        (.summary.requestsPerSec | round),
+        (.latencyPercentiles.p50 * 100000 | round / 100),
+        (.latencyPercentiles.p99 * 100000 | round / 100),
+        ([.statusCodeDistribution | to_entries[] | select(.key | startswith("2") | not) | .value] | add // 0),
+        $startup, $rss, $size ] | @tsv' "$OUT/$name.$endpoint.json" >> "$OUT/results.tsv"
+    tail -1 "$OUT/results.tsv" | awk -F'\t' '{printf "  %-10s %9s req/s  p50 %6s ms  p99 %6s ms\n", $3, $4, $5, $6}'
+  done
+  stop
+done
+
+[ -z "$CHECK_ONLY" ] || exit 0
+
+{
+  echo "## Run $(date '+%Y-%m-%d %H:%M')${SERVER_CPUS:+, servers capped at $SERVER_CPUS cores}"
+  echo
+  echo "Machine: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m), $(sysctl -n hw.ncpu 2>/dev/null) cores," \
+    "$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 )) GB; $(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null)."
+  echo "Load: oha $(oha --version | awk '{print $2}'), $CONNECTIONS connections, $WARMUP warmup then $DURATION measured per endpoint, on the same machine. JVM flags: \`$JVM_FLAGS\`."
+  echo
+  echo "| server | JDK | endpoint | req/s | p50 ms | p99 ms | non-2xx | startup ms | RSS MB | size MB |"
+  echo "|---|---|---|---:|---:|---:|---:|---:|---:|---:|"
+  tail -n +2 "$OUT/results.tsv" | awk -F'\t' '{printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6, $7, $8, $9, $10}'
+} > "$OUT/results.md"
+
+echo
+cat "$OUT/results.md"
+echo
+echo "bench: results in $OUT/ (results.md is the table for docs/benchmarks.md)"
