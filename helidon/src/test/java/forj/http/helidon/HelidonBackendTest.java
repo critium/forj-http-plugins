@@ -18,7 +18,10 @@ import forj.http.Status;
 import forj.http.server.Server;
 import forj.http.server.ServerConfig;
 import forj.typeclass.Sync;
+import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -33,6 +36,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
@@ -161,6 +165,63 @@ class HelidonBackendTest {
             assertEquals(500, boom.statusCode());
             assertEquals("", boom.body());
             assertEquals(200, send(at(server, "/users/1")).statusCode());
+        }
+    }
+
+    /**
+     * How streamed bodies go out. Helidon commits the response (status, headers, framing) on its
+     * first flush, or on close if nothing flushed: a small body still unsent at close gets a
+     * Content-Length, anything after a flush or past Helidon's buffer is chunked. So
+     * {@code Body.writer} ignores the writer's flush, and only {@code Body.streaming} passes it on.
+     */
+    @Test
+    void streamedBodies() throws Exception {
+        byte[] large = new byte[64 * 1024];
+        for (int i = 0; i < large.length; i++) large[i] = (byte) ('a' + i % 26);
+        CountDownLatch firstEventRead = new CountDownLatch(1);
+        AtomicBoolean writerWaited = new AtomicBoolean();
+        Routes<IO> routes = Routes.of(
+                // a writer that flushes, as forj-codec's encoder does: Body.writer swallows it
+                GET("/small").respond(req -> Ok().withBody(Body.writer(out -> {
+                    out.write("part1".getBytes(StandardCharsets.UTF_8));
+                    out.flush();
+                    out.write("part2".getBytes(StandardCharsets.UTF_8));
+                }, -1))),
+                GET("/large").respond(req -> Ok().withBody(Body.writer(out -> {
+                    for (int i = 0; i < large.length; i += 1000) out.write(large, i, Math.min(1000, large.length - i));
+                }, -1))),
+                // server-sent events: the first event must reach the client while the writer still runs
+                GET("/events").respond(req -> Ok().withBody(Body.streaming(out -> {
+                    out.write("event 1\n".getBytes(StandardCharsets.UTF_8));
+                    out.flush();
+                    try {
+                        writerWaited.set(firstEventRead.await(5, TimeUnit.SECONDS));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    out.write("event 2\n".getBytes(StandardCharsets.UTF_8));
+                }))));
+        HttpApp<IO> app = routes.orNotFound();
+
+        try (Server server = HelidonBackend.create().start(CONFIG, app)) {
+            HttpResponse<String> small = send(at(server, "/small"));
+            assertEquals("part1part2", small.body());
+            assertEquals("10", small.headers().firstValue("Content-Length").orElse("none"), "the flush didn't commit it");
+            assertTrue(small.headers().firstValue("Transfer-Encoding").isEmpty());
+
+            HttpResponse<byte[]> big = CLIENT.send(at(server, "/large").build(), BodyHandlers.ofByteArray());
+            assertTrue(java.util.Arrays.equals(large, big.body()), "all 64 KB arrive intact");
+            assertEquals("chunked", big.headers().firstValue("Transfer-Encoding").orElse("none"));
+
+            // the headers and the first event arrive before the writer returns, or this times out
+            HttpResponse<InputStream> events = CLIENT.sendAsync(at(server, "/events").build(), BodyHandlers.ofInputStream())
+                    .get(3, TimeUnit.SECONDS);
+            try (BufferedReader lines = new BufferedReader(new InputStreamReader(events.body(), StandardCharsets.UTF_8))) {
+                assertEquals("event 1", lines.readLine());
+                firstEventRead.countDown();
+                assertEquals("event 2", lines.readLine());
+            }
+            assertTrue(writerWaited.get(), "the client read event 1 while the writer was still waiting");
         }
     }
 

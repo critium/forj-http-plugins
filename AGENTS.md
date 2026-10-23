@@ -134,10 +134,10 @@ only where a file must stay parseable by plain tools.
 | Path | Contents |
 |---|---|
 | `helidon/src/main/java/forj/http/helidon/` | `HelidonBackend` (the `Backend`), `AppHandler` (Helidon request in, app run, response out), `LimitedInputStream` (the body limit), `HelidonServer` (drain on close or JVM exit) |
-| `helidon/src/test/java/forj/http/helidon/` | `HelidonBackendTest`: live tests on a random port with the JDK `HttpClient`, in `IO` and `Callable` |
+| `helidon/src/test/java/forj/http/helidon/` | `HelidonBackendTest`: live tests on a random port with the JDK `HttpClient`, in `IO` and `Callable`; `streamedBodies` pins how streamed bodies go out (a small `Body.writer` that flushes still gets `Content-Length`, 64 KB arrives chunked and intact, a `Body.streaming` flush reaches the client before the writer returns) |
 | `examples/src/main/java/forj/examples/http/users/` | the users example: `User`/`NewUser` (`derives Codec`), `UserRepo<F<_>>` (tagless, in-memory interpreter), `UserRoutes`, `Main` |
 | `examples/src/test/java/forj/examples/http/users/` | `UserRoutesTest` (no server, `IO` and `Callable`), `UsersLiveTest` (`Main.app()` on Helidon) |
-| `bench/src/main/java/forj/bench/` | `ForjHttpMain`: forj-http's rows in the benchmark (plaintext, JSON, a user by id over the example's `UserRepo`), with `FORJ_BENCH_JSON=codec|hand|stream` choosing how JSON is written; its test checks the bodies every row must give, in each mode |
+| `bench/src/main/java/forj/bench/` | `ForjHttpMain`: forj-http's rows in the benchmark (plaintext, JSON, a user by id over the example's `UserRepo`), with `FORJ_BENCH_JSON=codec|hand|stream` choosing how JSON is written, and `/users/first/{n}` (only here, not loaded by `bin/bench`) for body-size checks; its test checks the bodies every row must give, in each mode |
 | `bench/helidonse/`, `bench/http4s/`, `bench/spring/` | the comparison servers: raw Helidon SE, http4s Ember (Scala), Spring Boot MVC. Plain Java/Scala on JDK 25 (Mill fetches it), no forj |
 | `bin/bench` | runs each server under oha and writes a results table (`--check`: start and check answers, no load; `SERVER_CPUS=N`: each server's JVM sized for N cores) |
 | `docs/benchmarks.md` | the human page: current results (both runs), method, the oha-and-loopback ceiling caveat |

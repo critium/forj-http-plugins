@@ -27,6 +27,9 @@ class ForjHttpMainTest {
                     .hasBody("{\"id\":1,\"name\":\"user1\",\"email\":\"user1@example.com\"}");
             assertThat(run(app, Request.get("/users/1000"))).hasStatus(200);
             assertThat(run(app, Request.get("/users/1001"))).hasStatus(404);
+            assertThat(run(app, Request.get("/users/first/2")))
+                    .hasStatus(200)
+                    .hasBody("[{\"id\":1,\"name\":\"user1\",\"email\":\"user1@example.com\"},{\"id\":2,\"name\":\"user2\",\"email\":\"user2@example.com\"}]");
         }
     }
 }

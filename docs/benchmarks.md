@@ -25,15 +25,18 @@ machine:
 - **Startup:** about 330 ms for forj-http and Helidon, 760 ms for http4s, 860 ms for Spring.
   **Size on disk:** 3 MB for forj-http (forj, forj-http, forj-json and Helidon), 2.8 MB for
   Helidon alone, 19 MB for Spring, 34 MB for http4s (Scala's library included).
-- **Streaming JSON** (`forj-http-stream`) served 63k req/s on the JSON endpoints, 41% fewer than
-  the default `json(...)`. Its plaintext numbers match the other forj-http rows.
+- **Streaming JSON** (`forj-http-stream`, a `Body.writer`) matches the default `json(...)` on
+  bodies up to about 8 KB: about 107k req/s with `Content-Length`, the same framing as
+  `json(...)` ([streaming](#streaming-json)). On a 23 KB body it serves 37% fewer requests than
+  `json(...)`.
 - **Memory (RSS)** follows the JDK more than the framework: under the same `-Xmx1g`, the JDK 28
   rows used 140–255 MB and the JDK 25 rows 380–500 MB, raw Helidon included. Compare RSS only
   within a JDK.
 
 ## Run 1: uncapped
 
-`bin/bench`: every server, each free to use all 10 cores.
+`bin/bench`: every server, each free to use all 10 cores. (`forj-http-stream`'s rows are in
+[Streaming JSON](#streaming-json), measured after the current forj-http.)
 
 Machine: Apple M2 Pro, 10 cores, 32 GB; macOS 27.0.1.
 Load: oha 1.16.0, 64 connections, 10s warmup then 15s measured per endpoint, on the same machine. JVM flags: `-Xmx1g`.
@@ -46,9 +49,6 @@ Load: oha 1.16.0, 64 connections, 10s warmup then 15s measured per endpoint, on 
 | forj-http-hand | 28-ea+18-1391 | plaintext | 107106 | 0.59 | 0.8 | 0 | 334 | 220 | 3 |
 | forj-http-hand | 28-ea+18-1391 | json | 106913 | 0.59 | 0.79 | 0 | 334 | 218 | 3 |
 | forj-http-hand | 28-ea+18-1391 | users | 107830 | 0.59 | 0.83 | 0 | 334 | 217 | 3 |
-| forj-http-stream | 28-ea+18-1391 | plaintext | 106935 | 0.59 | 0.78 | 0 | 340 | 254 | 3 |
-| forj-http-stream | 28-ea+18-1391 | json | 63295 | 1.01 | 1.19 | 0 | 340 | 241 | 3 |
-| forj-http-stream | 28-ea+18-1391 | users | 63335 | 1.01 | 1.18 | 0 | 340 | 242 | 3 |
 | helidon-se-28 | 28-ea+18-1391 | plaintext | 106902 | 0.59 | 0.8 | 0 | 335 | 165 | 2.8 |
 | helidon-se-28 | 28-ea+18-1391 | json | 107143 | 0.59 | 0.81 | 0 | 335 | 168 | 2.8 |
 | helidon-se-28 | 28-ea+18-1391 | users | 108989 | 0.58 | 0.91 | 0 | 335 | 178 | 2.8 |
@@ -88,13 +88,49 @@ Load: oha 1.16.0, 64 connections, 10s warmup then 15s measured per endpoint, on 
 | spring | 25.0.2+10-LTS | json | 94706 | 0.66 | 1.27 | 0 | 865 | 386 | 18.8 |
 | spring | 25.0.2+10-LTS | users | 75914 | 0.82 | 1.58 | 0 | 865 | 397 | 18.8 |
 
+## Streaming JSON
+
+`forj-http-stream` writes JSON with forj-codec's streaming encoder into a `Body.writer`. A
+`Body.writer` ignores its writer's `flush()` and `close()`, so Helidon decides how the
+response goes out when the body is done: a body of up to about 8 KB gets a `Content-Length`
+(7.8 KB did, 9.0 KB didn't), and a larger one is sent chunked. Earlier forj-http versions passed
+the encoder's flush through, which sent every streamed response chunked and cost 41% of
+throughput on small bodies; [benchmarks-for-agents.md](benchmarks-for-agents.md) has the
+investigation.
+
+`bin/bench forj-http forj-http-stream` (2026-10-23, on mains power):
+
+| server | JDK | endpoint | req/s | p50 ms | p99 ms | non-2xx | startup ms | RSS MB | size MB |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| forj-http | 28-ea+18-1391 | plaintext | 106954 | 0.6 | 0.8 | 0 | 341 | 225 | 3 |
+| forj-http | 28-ea+18-1391 | json | 107109 | 0.59 | 0.88 | 0 | 341 | 221 | 3 |
+| forj-http | 28-ea+18-1391 | users | 107389 | 0.59 | 0.83 | 0 | 341 | 240 | 3 |
+| forj-http-stream | 28-ea+18-1391 | plaintext | 107144 | 0.59 | 0.8 | 0 | 335 | 242 | 3 |
+| forj-http-stream | 28-ea+18-1391 | json | 106907 | 0.59 | 0.85 | 0 | 335 | 233 | 3 |
+| forj-http-stream | 28-ea+18-1391 | users | 107004 | 0.59 | 0.85 | 0 | 335 | 247 | 3 |
+
+How each size goes out (single requests): `json(...)` always sends `Content-Length`; the
+stream row sends `Content-Length` at 51 B, 4.1 KB and 7.8 KB, and goes chunked at 9.0 KB and
+22.9 KB.
+
+Throughput on bigger bodies, from `GET /users/first/{n}` (the first n users as a JSON list;
+forj-http's server only), 64 connections, 5 s warmup and 10 s measured:
+
+| body | req/s, `json(...)` | req/s, stream | p50, `json(...)` | p50, stream | p99, `json(...)` | p99, stream |
+|---|---:|---:|---:|---:|---:|---:|
+| 7.8 KB | 108849 | 108745 | 0.53 ms | 0.53 ms | 1.61 ms | 1.65 ms |
+| 22.9 KB | 68841 | 43354 | 0.85 ms | 0.52 ms | 2.19 ms | 1.51 ms |
+
+At 22.9 KB the stream row's p50 and p99 are lower than `json(...)`'s, yet its throughput is 37%
+lower: a few requests take far longer than the p99.
+
 ## What runs
 
 | Row | What | JDK | JSON |
 |---|---|---|---|
 | `forj-http` | forj-http on Helidon (`forj.bench.ForjHttpMain`), routes generic in `F`, run in `IO`, no middleware. JSON as an app writes it: `Ok(json(user))` | 28 EA (preview, as forj requires) | forj-json, `derives Codec`, into a `byte[]` |
 | `forj-http-hand` | the same server, JSON written by hand as in the raw Helidon SE row, so the gap to that row is forj-http alone | 28 EA | written by hand |
-| `forj-http-stream` | the same server, with forj-codec's streaming writer: `Json.encode(value, out)` in a `Body.writer`, straight onto the connection through a pooled, bounded buffer, with no `byte[]` per response and no `Content-Length` (the response is chunked) | 28 EA | forj-json, `derives Codec`, streamed |
+| `forj-http-stream` | the same server, with forj-codec's streaming writer: `Json.encode(value, out)` in a `Body.writer`, onto the connection through a pooled, bounded buffer, with no `byte[]` per response. Helidon frames it (see [Streaming JSON](#streaming-json)) | 28 EA | forj-json, `derives Codec`, streamed |
 | `helidon-se-28` | raw Helidon SE 4 (`HelidonSeMain`): Helidon's routing and handlers, nothing on top. The floor: forj-http's overhead is the gap to this row | 28 EA | written by hand |
 | `helidon-se-25` | the same, on JDK 25, so a JDK difference shows apart from a framework one | 25 LTS | written by hand |
 | `http4s` | http4s 0.23 on Ember (`Http4sMain`), the pure-FP design forj-http is modelled on | 25 LTS | jsoniter-scala, compile-time derived |
@@ -119,6 +155,7 @@ type on each endpoint, so no row wins by doing less.
 
 ## Method
 
+- The machine is on mains power, with nothing else heavy running.
 - Servers run one at a time, outside Mill, with the same JVM flags (`-Xmx1g`, plus
   `-XX:ActiveProcessorCount=N` when `SERVER_CPUS=N` is set) and port.
 - Each endpoint gets a warmup run (10 s), then a measured run (15 s), with 64 connections and

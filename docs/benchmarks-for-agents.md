@@ -15,6 +15,8 @@ history or reasoning) and record process here.
 - **One machine, one run at a time.** The Mac is shared with forj-codec's JMH runs and other
   sessions' builds. Before a load run, check with the forj-orchestrator session; tell it when
   the run starts and ends so it can hold and release the other sessions.
+- **Mains power only.** Check `pmset -g batt` says AC Power before a run and log it during the
+  run (every 5 s); a run with any battery period is discarded (run 4).
 - **Same flags for every row:** `-Xmx1g` (plus `-XX:ActiveProcessorCount` under `SERVER_CPUS`),
   same port, same oha settings. Compare RSS only within a JDK (see the runs below).
 - **No reflection in forj-http or the backend.** Spring and Jackson are reference rows in
@@ -70,16 +72,66 @@ helidon-se-28 http4s spring`; raw output in `out/bench/20261023-165556/`.
 - http4s is the row the cap reaches: 68–80k req/s (24–35% behind forj-http), p99 1.6–1.7 ms.
 - Spring about as in run 1 (10% behind on plaintext/JSON, 28% on users).
 
+### Run 3 (2026-10-23 18:01): the streaming slowdown, no-flush codec variant
+
+Lead: forj-codec (suspected `ForjWriter.close()` calling `out.flush()`). Before any load, single
+curl requests showed the mechanism: `json(...)` answered `Content-Length: 51` in one read; the
+stream row answered `Transfer-Encoding: chunked` in two reads (57 bytes: chunk header, JSON,
+CRLF; then 5 bytes: `0\r\n\r\n`).
+
+forj-codec published `forj:forj-json:0.1.0-noflush-SNAPSHOT` (close() writes its buffer but
+doesn't flush the stream). `bench` was pinned to it temporarily (`.forceVersion()` in
+`build.mill`, restored after, `./mill clean` both sides). With it, the stream response went out
+with `Content-Length: 51` in one read, and in the same session:
+
+- no-flush: forj-http 107.0–108.0k req/s; forj-http-stream 107.1–108.1k, p99 0.84–1.0 ms;
+- baseline (normal forj-json): forj-http 107.1–108.0k; forj-http-stream json 63.1k, users
+  63.5k, p99 1.24–1.26 ms (the 41% again).
+
+Conclusion: the flush made Helidon commit status and headers before the body was complete, so
+it had to send chunked, with the closing chunk as a separate write. Unflushed, Helidon buffers
+a small body and sets `Content-Length` itself. Raw: `out/bench/20261023-180101/` (no-flush),
+`20261023-180341/` (baseline).
+
+**The fix the user chose (option K), in forj-http, not forj-codec:** `Body.writer(w, len)`
+hands the writer a guarded stream whose `flush()` and `close()` do nothing, so the backend's
+close is the one commit. A new `Body.streaming(w)` passes flushes through (SSE, early sends;
+length -1, chunked). forj-json is unchanged. The backend needed no change (AppHandler already
+closes after `writeTo` and never flushes); `HelidonBackendTest.streamedBodies` now pins the
+three behaviours.
+
+### Run 4 (2026-10-23 ~18:25): discarded
+
+Started on battery (`pmset`: 94%, discharging); stopped about 2 minutes in, numbers thrown
+away. Runs now log `pmset -g batt` every 5 s and abort if the power source isn't AC.
+
+### Run 5 (2026-10-23 18:31): after the fix, on AC power
+
+`bin/bench forj-http forj-http-stream` against the republished forj-http (design K) and the
+normal forj-json, then codec-vs-stream on bigger bodies via `GET /users/first/{n}` (added to
+`ForjHttpMain` for this; 5 s warmup, 10 s measured). 44 power samples, all AC. Raw:
+`out/bench/20261023-183128/`.
+
+- forj-http-stream 106.9–107.1k req/s, p99 0.8–0.85 ms; forj-http 107.0–107.4k. Fixed.
+- Framing (single curl requests): stream has `Content-Length` at 51 B, 4.1 KB and 7.8 KB;
+  chunked at 9.0 KB and 22.9 KB (`json(...)` is `Content-Length` at every size). Before the
+  fix the stream row was chunked at every size.
+- 7.8 KB: json(...) 108.8k, stream 108.7k req/s.
+- 22.9 KB: json(...) 68.8k req/s (p50 0.85, p99 2.19 ms), stream 43.4k (p50 0.52, p99 1.51 ms).
+  With 64 connections, 43.4k req/s means a mean latency of about 1.48 ms, above the p99, so a
+  small share of stream requests are very slow. Not investigated; oha's JSON for this wasn't
+  kept (`sizes.sh` printed only the summary).
+
 ## 4. Open questions
 
 - **forj-http's real overhead over raw Helidon SE.** Plan target: within ~10–15% on the same
   JDK. Both runs show ≤2%, but only because neither reached the server's limit; the target is
   met but the margin is unknown.
-- **Why `forj-http-stream` is 41% slower on small bodies.** Deferred by the user to next week
-  (2026-10-23); not investigated. Observed facts only: the response has no `Content-Length`
-  and goes out chunked; plaintext on the same server is unaffected. Relevant to forj-codec and
-  forj-http (whether streaming is a recommended path for small bodies); don't document a cause
-  in the human docs until it's measured.
+- **Streaming slowdown on small bodies: solved** (runs 3 and 5). Kept here for the record.
+- **Chunked stream bodies over ~8 KB lose 37% of throughput (22.9 KB) with a long tail beyond
+  the p99.** Unexplained. Candidates to test, none measured: the extra write for the closing
+  chunk interacting with delayed ACKs/Nagle on loopback, or chunk-size framing overhead. Keep
+  oha's JSON (`slowest`, the latency histogram) next time.
 - **"Well above http4s"** (plan): on throughput, only clearly so under the 4-core cap; on p99
   latency it holds in both runs.
 
@@ -90,7 +142,9 @@ helidon-se-28 http4s spring`; raw output in `out/bench/20261023-165556/`.
    match, try `SERVER_CPUS=1`.
 2. The proper fix: oha on a second machine (`bin/bench` would need a `HOST` option and a way to
    start the server remotely), or Linux with `taskset` for strict pinning.
-3. The streaming question (section 4), when the user picks it up: compare write counts or
-   syscalls per response (e.g. `dtruss`), and try a known length or a single flush.
-4. After any run: add a section to this log, then update the tables and summary in
+3. The large-body stream tail (section 4): rerun `/users/first/400` codec vs stream keeping
+   oha's full JSON, then look at write counts per response; compare a `Body.writer` with a
+   known length.
+4. Before any run: on AC power (`pmset -g batt`), others on hold via forj-orchestrator.
+5. After any run: add a section to this log, then update the tables and summary in
    [benchmarks.md](benchmarks.md) and the README's status.

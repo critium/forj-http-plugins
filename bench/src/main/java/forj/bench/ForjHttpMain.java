@@ -20,6 +20,7 @@ import forj.http.server.ServerConfig;
 import forj.json.Json;
 import forj.typeclass.Functor;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 /**
  * forj-http's rows in bin/bench: the three endpoints every server in the benchmark serves, with
@@ -29,7 +30,10 @@ import java.nio.charset.StandardCharsets;
  * <ul>
  *   <li>{@code GET /plaintext}: {@code Hello, World!} as text/plain;
  *   <li>{@code GET /json}: {@code {"message":"Hello, World!"}};
- *   <li>{@code GET /users/{id}}: one of {@value #USERS} users as JSON, or 404.
+ *   <li>{@code GET /users/{id}}: one of {@value #USERS} users as JSON, or 404;
+ *   <li>{@code GET /users/first/{n}}: the first {@code n} users as a JSON list (about 52 bytes
+ *       each), for checking how bodies of a given size go out. Only this server has it, so
+ *       bin/bench doesn't load it.
  * </ul>
  *
  * <p>{@code FORJ_BENCH_JSON} picks how JSON is written, one bin/bench row each, so the rows
@@ -61,6 +65,8 @@ public final class ForjHttpMain {
 
     static final Path1<Long> USER = Path.of("/users").then(LongVar);
 
+    static final Path1<Integer> FIRST = Path.of("/users/first").then(IntVar);
+
     static final Message HELLO = new Message("Hello, World!");
 
     /** Written for any {@code F}, as an app would be; bin/bench runs it in {@code IO}. */
@@ -71,6 +77,13 @@ public final class ForjHttpMain {
                     case CODEC -> json(HELLO);
                     case HAND -> hand(s"{\"message\":\"${HELLO.message()}\"}");
                     case STREAM -> stream(HELLO);
+                })),
+                GET(FIRST).to((req, n) -> repo.list("").map(users -> {
+                    List<User> first = users.subList(0, Math.min(n, users.size()));
+                    return Ok(switch (mode) {
+                        case CODEC, HAND -> json(first);
+                        case STREAM -> stream(first);
+                    });
                 })),
                 GET(USER).to((req, id) -> repo.find(id).map(found -> found.map(user -> Ok(switch (mode) {
                     case CODEC -> json(user);
